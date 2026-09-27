@@ -64,13 +64,26 @@ pub fn get_default_models_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    // 2. Check local ./models folder
+    // 2. Check ~/ViveStream/AI/Whisper (standard ViveStream directory)
+    if let Some(user_home) = dirs_home_dir() {
+        let p = user_home.join("ViveStream").join("AI").join("Whisper");
+        if p.exists() {
+            return p;
+        }
+    }
+
+    // 3. Check local ./models folder
     let local_models = PathBuf::from("models");
     if local_models.exists() {
         return local_models;
     }
 
-    // 3. Fallback to AppData/Local/Vivestream/whisper/models
+    // 4. Default to ~/ViveStream/AI/Whisper
+    if let Some(user_home) = dirs_home_dir() {
+        return user_home.join("ViveStream").join("AI").join("Whisper");
+    }
+
+    // 5. Fallback to AppData/Local/Vivestream/whisper/models
     if let Some(mut base) = dirs_local_data() {
         base.push("VivestreamRevived");
         base.push("whisper");
@@ -79,6 +92,12 @@ pub fn get_default_models_dir() -> PathBuf {
     }
 
     PathBuf::from("models")
+}
+
+fn dirs_home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
 }
 
 fn dirs_local_data() -> Option<PathBuf> {
