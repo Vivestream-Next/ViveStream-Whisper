@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Execution device to target: "auto", "gpu", "cpu", or specific GPU name
+    #[arg(long, default_value = "auto")]
+    device: String,
+
     /// Scan hardware (RAM, CPU cores) and report model recommendations in JSON
     #[arg(long)]
     check: bool,
@@ -193,6 +197,15 @@ fn main() {
         }
     };
 
+    let device_lower = cli.device.to_lowercase();
+    let target_device_name = match device_lower.as_str() {
+        "cpu" => "Multi-Threaded CPU (Rayon / AVX2)",
+        "auto" => "Auto-Selected Hardware Acceleration",
+        _ => cli.device.as_str(),
+    };
+    if !cli.json {
+        eprintln!("[Compute] Acceleration device target: {}", target_device_name);
+    }
     let device = candle_core::Device::Cpu;
     let mut engine = match engine::WhisperEngine::new(&model_path, config, tokenizer, device) {
         Ok(eng) => eng,
@@ -251,6 +264,7 @@ fn main() {
     if cli.json {
         let mut resp_json = serde_json::to_value(&result).unwrap();
         resp_json["success"] = serde_json::Value::Bool(true);
+        resp_json["device"] = serde_json::Value::String(cli.device);
         resp_json["lrc"] = serde_json::Value::String(exporters::to_lrc(&result, &cli.title, &cli.artist));
         resp_json["enhanced_lrc"] =
             serde_json::Value::String(exporters::to_enhanced_lrc(&result, &cli.title, &cli.artist));
