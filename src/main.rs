@@ -56,24 +56,79 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Stream NDJSON progress events to stderr while transcribing
+    #[arg(long)]
+    progress: bool,
+
     /// Execution device to target: "auto", "gpu", "cpu", or specific GPU name
     #[arg(long, default_value = "auto")]
     device: String,
 
-    /// Scan hardware (RAM, CPU cores) and report model recommendations in JSON
+    /// Scan hardware (RAM, CPU cores, discrete GPUs) and report model recommendations in JSON
     #[arg(long)]
     check: bool,
+
+    /// Fast audio probe: inspect duration, sample rate, channels, codec without loading model
+    #[arg(long)]
+    probe: bool,
+
+    /// Run synthetic performance benchmark on target model & compute device
+    #[arg(long)]
+    benchmark: bool,
+
+    /// Print machine-readable capabilities (supported models, formats, backends)
+    #[arg(long)]
+    capabilities: bool,
 
     /// List supported models and whether they are installed locally
     #[arg(long)]
     list_models: bool,
 }
 
+fn emit_progress(enabled: bool, stage: &str, percent: f64, seek_sec: f64, total_sec: f64, message: &str) {
+    if !enabled {
+        return;
+    }
+    let evt = serde_json::json!({
+        "type": "progress",
+        "stage": stage,
+        "percent": (percent * 10.0).round() / 10.0,
+        "seek_sec": (seek_sec * 10.0).round() / 10.0,
+        "total_sec": (total_sec * 10.0).round() / 10.0,
+        "message": message,
+    });
+    eprintln!("{}", serde_json::to_string(&evt).unwrap_or_default());
+}
+
 fn main() {
     let cli = Cli::parse();
     let models_dir = cli.models_dir.unwrap_or_else(models::get_default_models_dir);
 
-    // 1. Hardware scan and diagnostics mode
+    // 1. Machine-readable capabilities mode
+    if cli.capabilities {
+        let resp = serde_json::json!({
+            "engine": "vivestream-whisper",
+            "version": env!("CARGO_PKG_VERSION"),
+            "candle_version": "0.11.0",
+            "supported_models": ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+            "supported_formats": ["lrc", "elrc", "srt", "vtt", "json", "all"],
+            "supported_codecs": ["mp3", "flac", "wav", "aac", "m4a", "ogg", "alac"],
+            "tasks": ["transcribe", "translate"],
+            "features": [
+                "word_level_timing",
+                "sliding_window_mel",
+                "gpu_hardware_detection",
+                "stream_progress_events",
+                "audio_probe",
+                "inference_benchmark"
+            ],
+            "compute_backends": ["auto", "cpu", "gpu"]
+        });
+        println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+        return;
+    }
+
+    // 2. Hardware scan and diagnostics mode (includes GPU detection)
     if cli.check {
         let diag = system::scan_system();
         let local_models = models::list_local_models(&models_dir);
@@ -87,7 +142,107 @@ fn main() {
         return;
     }
 
-    // 2. List local models mode
+    // 3. Fast audio probe mode (no model loading required)
+    if cli.probe {
+        let audio_path = match cli.audio {
+            Some(p) => p,
+            None => {
+                eprintln!("Error: --probe requires an input media path. Use --help for usage.");
+                std::process::exit(1);
+            }
+        };
+        match audio::probe_audio(&audio_path) {
+            Ok(info) => {
+                let resp = serde_json::json!({
+                    "success": true,
+                    "media_path": audio_path.to_string_lossy(),
+                    "probe": info,
+                });
+                println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+            }
+            Err(e) => {
+                if cli.json {
+                    println!("{}", serde_json::json!({ "success": false, "error": e }));
+                } else {
+                    eprintln!("Probe error: {}", e);
+                }
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // 4. Synthetic performance benchmark mode
+    if cli.benchmark {
+        let model_name = &cli.model;
+        let model_path = match models::find_model(model_name, &models_dir) {
+            Some(p) => p,
+            None => {
+                let msg = format!(
+                    "Model '{}' not found in '{}' for benchmark. Download it first via ViveStream.",
+                    model_name,
+                    models_dir.display()
+                );
+                if cli.json {
+                    println!("{}", serde_json::json!({ "success": false, "error": msg }));
+                } else {
+                    eprintln!("Error: {}", msg);
+                }
+                std::process::exit(1);
+            }
+        };
+
+        let config = engine::get_config_for_model(model_name);
+        let tokenizer_bytes = include_bytes!("tokenizer.json");
+        let tokenizer = match tokenizers::Tokenizer::from_bytes(tokenizer_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Failed to initialize tokenizer: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let start_load = std::time::Instant::now();
+        let mut engine = match engine::WhisperEngine::new(&model_path, config, tokenizer, candle_core::Device::Cpu) {
+            Ok(eng) => eng,
+            Err(e) => {
+                eprintln!("Benchmark engine load error: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let load_ms = start_load.elapsed().as_millis();
+
+        // 5.0 seconds of synthetic audio at 16,000 Hz
+        let sample_count = 16000 * 5;
+        let pcm: Vec<f32> = (0..sample_count)
+            .map(|i| {
+                let t = i as f32 / 16000.0;
+                0.2 * (2.0 * std::f32::consts::PI * 300.0 * t).sin()
+                    + 0.1 * (2.0 * std::f32::consts::PI * 600.0 * t).sin()
+            })
+            .collect();
+
+        let start_infer = std::time::Instant::now();
+        let res = engine.transcribe_pcm(&pcm, Some("en"), "transcribe");
+        let infer_ms = start_infer.elapsed().as_millis().max(1);
+        let audio_dur = 5.0;
+        let rtf = audio_dur / (infer_ms as f64 / 1000.0);
+
+        let resp = serde_json::json!({
+            "success": res.is_ok(),
+            "model": model_name,
+            "device": cli.device,
+            "audio_duration_sec": audio_dur,
+            "model_load_ms": load_ms,
+            "inference_ms": infer_ms,
+            "real_time_factor": (rtf * 10.0).round() / 10.0,
+            "speedup": format!("{:.1}x real-time", rtf),
+        });
+        println!("{}", serde_json::to_string_pretty(&resp).unwrap());
+        return;
+    }
+
+    // 5. List local models mode
     if cli.list_models {
         let local_models = models::list_local_models(&models_dir);
         let resp = serde_json::json!({
@@ -98,7 +253,7 @@ fn main() {
         return;
     }
 
-    // 3. Audio transcription mode
+    // 6. Audio transcription mode
     let audio_path = match cli.audio {
         Some(p) => p,
         None => {
@@ -155,6 +310,7 @@ fn main() {
     };
 
     // 1. Decode audio in pure Rust (Symphonia)
+    emit_progress(cli.progress, "decoding", 5.0, 0.0, 0.0, "Decoding audio stream...");
     if !cli.json {
         eprintln!("[1/3] Decoding audio: {}...", audio_path.display());
     }
@@ -171,6 +327,7 @@ fn main() {
     };
 
     let audio_dur = pcm.len() as f64 / 16000.0;
+    emit_progress(cli.progress, "mel", 10.0, 0.0, audio_dur, "Computing mel spectrogram...");
     if !cli.json {
         eprintln!(
             "[2/3] Loaded {:.2}s of audio. Loading model: {}...",
@@ -220,11 +377,17 @@ fn main() {
         }
     };
 
-    // 3. Transcribe
+    // 3. Transcribe with optional progress streaming
     if !cli.json {
         eprintln!("[3/3] Generating synchronized lyrics and subtitles...");
     }
-    let result = match engine.transcribe_pcm(&pcm, Some(&cli.language), &cli.task) {
+
+    let progress_flag = cli.progress;
+    let mut on_prog = move |pct: f64, seek: f64, total: f64, msg: &str| {
+        emit_progress(progress_flag, "transcribing", pct, seek, total, msg);
+    };
+
+    let result = match engine.transcribe_pcm_with_progress(&pcm, Some(&cli.language), &cli.task, Some(&mut on_prog)) {
         Ok(res) => res,
         Err(e) => {
             let err_msg = format!("Transcription error: {}", e);
@@ -238,6 +401,7 @@ fn main() {
     };
 
     // 4. Save exported files
+    emit_progress(cli.progress, "exporting", 98.0, audio_dur, audio_dur, "Writing exported files...");
     let out_dir = cli.output_dir.unwrap_or_else(|| {
         audio_path
             .parent()
@@ -259,6 +423,8 @@ fn main() {
             Vec::new()
         }
     };
+
+    emit_progress(cli.progress, "complete", 100.0, audio_dur, audio_dur, "Finished transcription.");
 
     // 5. Output
     if cli.json {
