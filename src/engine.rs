@@ -259,6 +259,16 @@ impl WhisperEngine {
         requested_language: Option<&str>,
         task: &str,
     ) -> Result<TranscriptionResult, String> {
+        self.transcribe_pcm_with_progress(pcm, requested_language, task, None)
+    }
+
+    pub fn transcribe_pcm_with_progress(
+        &mut self,
+        pcm: &[f32],
+        requested_language: Option<&str>,
+        task: &str,
+        mut on_progress: Option<&mut dyn FnMut(f64, f64, f64, &str)>,
+    ) -> Result<TranscriptionResult, String> {
         if pcm.is_empty() {
             return Ok(TranscriptionResult {
                 text: String::new(),
@@ -332,6 +342,12 @@ impl WhisperEngine {
             let time_offset = (seek * HOP_LENGTH) as f64 / SAMPLE_RATE as f64;
             if time_offset >= total_duration {
                 break;
+            }
+
+            let pct = (10.0 + (seek as f64 / total_frames.max(1) as f64) * 85.0).min(98.0);
+            if let Some(ref mut cb) = on_progress {
+                let msg = format!("Transcribing audio at {:.1}s / {:.1}s", time_offset, total_duration);
+                cb(pct, time_offset, total_duration, &msg);
             }
 
             let segment_size = usize::min(total_frames - seek, N_FRAMES);
@@ -453,6 +469,10 @@ impl WhisperEngine {
             }
 
             seek += segment_size;
+        }
+
+        if let Some(ref mut cb) = on_progress {
+            cb(99.0, total_duration, total_duration, "Compiling full transcript and subtitle exports");
         }
 
         let full_text = full_text_parts.join(" ");
