@@ -315,6 +315,10 @@ impl WhisperEngine {
             .tokenizer
             .token_to_id(m_whisper::EOT_TOKEN)
             .unwrap_or(50257);
+        let no_timestamps_token = self
+            .tokenizer
+            .token_to_id(m_whisper::NO_TIMESTAMPS_TOKEN)
+            .unwrap_or(50363);
 
         let task_token = if task == "translate" {
             translate_token
@@ -393,22 +397,22 @@ impl WhisperEngine {
                 tokens.push(id);
             }
             tokens.push(task_token);
+            tokens.push(no_timestamps_token);
 
             let mut raw_tokens = Vec::new();
             let max_steps = 224;
 
-            // Prompt forward pass (flush: true)
-            let prompt_t = Tensor::new(&tokens[..], &self.device)
-                .and_then(|t| t.unsqueeze(0))
-                .map_err(|e| format!("Tensor creation error: {}", e))?;
+            for step in 0..max_steps {
+                let tokens_t = Tensor::new(&tokens[..], &self.device)
+                    .and_then(|t| t.unsqueeze(0))
+                    .map_err(|e| format!("Tokens tensor error: {}", e))?;
 
-            let mut ys = self
-                .model
-                .decoder
-                .forward(&prompt_t, &encoder_output, true)
-                .map_err(|e| format!("Decoder forward error: {}", e))?;
+                let ys = self
+                    .model
+                    .decoder
+                    .forward(&tokens_t, &encoder_output, step == 0)
+                    .map_err(|e| format!("Decoder forward error: {}", e))?;
 
-            for _step in 0..max_steps {
                 let (_, seq_len, _) = ys
                     .dims3()
                     .map_err(|e| format!("Decoder dims3 error: {}", e))?;
@@ -434,23 +438,33 @@ impl WhisperEngine {
                     .and_then(|t| t.to_scalar::<u32>())
                     .map_err(|e| format!("Argmax error: {}", e))?;
 
-                if next_token == eot_token {
+                if next_token == eot_token || tokens.len() >= self.config.max_target_positions {
+                    break;
+                }
+
+                // Check for infinite repetition loops (1-gram, 2-gram, 3-gram)
+                raw_tokens.push(next_token);
+                let rlen = raw_tokens.len();
+                let has_loop = (rlen >= 4
+                    && raw_tokens[rlen - 1] == raw_tokens[rlen - 2]
+                    && raw_tokens[rlen - 2] == raw_tokens[rlen - 3]
+                    && raw_tokens[rlen - 3] == raw_tokens[rlen - 4])
+                    || (rlen >= 6
+                        && raw_tokens[rlen - 1] == raw_tokens[rlen - 3]
+                        && raw_tokens[rlen - 3] == raw_tokens[rlen - 5]
+                        && raw_tokens[rlen - 2] == raw_tokens[rlen - 4])
+                    || (rlen >= 9
+                        && raw_tokens[rlen - 1] == raw_tokens[rlen - 4]
+                        && raw_tokens[rlen - 4] == raw_tokens[rlen - 7]
+                        && raw_tokens[rlen - 2] == raw_tokens[rlen - 5]
+                        && raw_tokens[rlen - 5] == raw_tokens[rlen - 8]
+                        && raw_tokens[rlen - 3] == raw_tokens[rlen - 6]);
+
+                if has_loop {
                     break;
                 }
 
                 tokens.push(next_token);
-                raw_tokens.push(next_token);
-
-                // Incremental decoding using KV-caching (flush: false)
-                let next_t = Tensor::new(&[next_token], &self.device)
-                    .and_then(|t| t.unsqueeze(0))
-                    .map_err(|e| format!("Next token tensor error: {}", e))?;
-
-                ys = self
-                    .model
-                    .decoder
-                    .forward(&next_t, &encoder_output, false)
-                    .map_err(|e| format!("Decoder step forward error: {}", e))?;
             }
 
             // Parse tokens, timestamps, and reconstruct words with BPE subword awareness
@@ -485,7 +499,7 @@ impl WhisperEngine {
         })
     }
 
-    /// Parse tokens into segments and words using Whisper timestamp tokens and BPE subword merging.
+    /// Parse tokens into segments and words using HuggingFace tokenizer decoding.
     fn parse_chunk_tokens(
         &self,
         tokens: &[u32],
@@ -497,65 +511,35 @@ impl WhisperEngine {
             return Vec::new();
         }
 
-        // Subword-aware token grouping: group tokens into words
-        let mut grouped_words: Vec<(String, f64, f64)> = Vec::new();
-        let mut current_word_tokens: Vec<u32> = Vec::new();
-
-        let flush_current_word = |word_tokens: &mut Vec<u32>, out_words: &mut Vec<(String, f64, f64)>| {
-            if word_tokens.is_empty() {
-                return;
-            }
-            if let Ok(decoded) = self.tokenizer.decode(word_tokens, true) {
-                let trimmed = decoded.trim().to_string();
-                if !trimmed.is_empty() {
-                    out_words.push((trimmed, 0.0, 0.0));
-                }
-            }
-            word_tokens.clear();
-        };
-
-        for &tok in tokens {
-            // Check if token is a special or timestamp token
-            if tok >= 50257 {
-                continue;
-            }
-
-            if let Ok(tok_str) = self.tokenizer.decode(&[tok], false) {
-                let starts_new_word = tok_str.starts_with(' ')
-                    || tok_str.starts_with('\u{0120}')
-                    || current_word_tokens.is_empty();
-
-                if starts_new_word && !current_word_tokens.is_empty() {
-                    flush_current_word(&mut current_word_tokens, &mut grouped_words);
-                }
-                current_word_tokens.push(tok);
-            }
-        }
-        flush_current_word(&mut current_word_tokens, &mut grouped_words);
-
-        if grouped_words.is_empty() {
+        // Clean tokens: filter out any special tokens >= 50257
+        let speech_tokens: Vec<u32> = tokens.iter().copied().filter(|&t| t < 50257).collect();
+        if speech_tokens.is_empty() {
             return Vec::new();
         }
 
-        // Calculate timings across the actual chunk duration
-        let word_count = grouped_words.len();
-        let step_dur = chunk_duration / (word_count as f64);
-        let mut words_with_timing = Vec::new();
-        let mut full_sentence = String::new();
+        let decoded_text = match self.tokenizer.decode(&speech_tokens, true) {
+            Ok(t) => t.trim().to_string(),
+            Err(_) => return Vec::new(),
+        };
 
-        for (i, (w_text, _, _)) in grouped_words.into_iter().enumerate() {
+        if decoded_text.is_empty() {
+            return Vec::new();
+        }
+
+        let words: Vec<&str> = decoded_text.split_whitespace().collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+
+        let word_count = words.len();
+        let step_dur = chunk_duration / (word_count as f64);
+        let mut words_with_timing = Vec::with_capacity(word_count);
+
+        for (i, &w_str) in words.iter().enumerate() {
             let w_start = time_offset + (i as f64 * step_dur);
             let w_end = w_start + step_dur;
-
-            let is_punct = w_text.len() == 1
-                && w_text.chars().next().is_some_and(|c| c.is_ascii_punctuation());
-            if !full_sentence.is_empty() && (!is_punct || w_text == "(" || w_text == "[") {
-                full_sentence.push(' ');
-            }
-            full_sentence.push_str(&w_text);
-
             words_with_timing.push(WordTiming {
-                word: w_text,
+                word: w_str.to_string(),
                 start: (w_start * 100.0).round() / 100.0,
                 end: (w_end * 100.0).round() / 100.0,
                 probability: 0.95,
@@ -569,7 +553,7 @@ impl WhisperEngine {
             id: *segment_id,
             start: seg_start,
             end: seg_end,
-            text: full_sentence.trim().to_string(),
+            text: decoded_text,
             words: words_with_timing,
         };
         *segment_id += 1;
