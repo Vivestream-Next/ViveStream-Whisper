@@ -1,5 +1,6 @@
 //! Pure Rust multi-format audio decoder and 16,000 Hz resampler using Symphonia.
 
+use serde::Serialize;
 use std::fs::File;
 use std::path::Path;
 use symphonia::core::audio::{AudioBufferRef, Signal};
@@ -11,6 +12,71 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AudioProbeInfo {
+    pub duration_seconds: f64,
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub codec: String,
+    pub file_size_bytes: u64,
+    pub estimated_30s_chunks: usize,
+}
+
+pub fn probe_audio<P: AsRef<Path>>(path: P) -> Result<AudioProbeInfo, String> {
+    let p = path.as_ref();
+    let file_size_bytes = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let src = File::open(p).map_err(|e| format!("Failed to open media file: {}", e))?;
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let format_opts = FormatOptions {
+        enable_gapless: true,
+        ..Default::default()
+    };
+    let metadata_opts = MetadataOptions::default();
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &format_opts, &metadata_opts)
+        .map_err(|e| format!("Unsupported format or corrupt stream: {}", e))?;
+
+    let format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| "No supported audio tracks found".to_string())?;
+
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+    let codec = format!("{:?}", track.codec_params.codec);
+
+    let duration_seconds = if let (Some(n_frames), Some(tb)) = (track.codec_params.n_frames, track.codec_params.time_base) {
+        let time = tb.calc_time(n_frames);
+        time.seconds as f64 + time.frac
+    } else {
+        0.0
+    };
+
+    let estimated_30s_chunks = if duration_seconds > 0.0 {
+        (duration_seconds / 30.0).ceil() as usize
+    } else {
+        1
+    };
+
+    Ok(AudioProbeInfo {
+        duration_seconds,
+        sample_rate,
+        channels,
+        codec,
+        file_size_bytes,
+        estimated_30s_chunks,
+    })
+}
 
 pub fn load_audio<P: AsRef<Path>>(path: P) -> Result<Vec<f32>, String> {
     let src = File::open(&path).map_err(|e| format!("Failed to open audio file: {}", e))?;
