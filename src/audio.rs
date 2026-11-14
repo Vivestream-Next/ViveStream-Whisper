@@ -306,6 +306,40 @@ pub fn linear_resample(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> 
     output
 }
 
+pub fn write_wav<P: AsRef<Path>>(samples: &[f32], path: P) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = File::create(path).map_err(|e| format!("Failed to create WAV: {}", e))?;
+    let data_len = (samples.len() * 2) as u32;
+    let file_len = data_len + 36;
+
+    // RIFF header
+    file.write_all(b"RIFF").map_err(|e| e.to_string())?;
+    file.write_all(&file_len.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(b"WAVE").map_err(|e| e.to_string())?;
+
+    // fmt subchunk
+    file.write_all(b"fmt ").map_err(|e| e.to_string())?;
+    file.write_all(&16u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&1u16.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&16000u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&(16000u32 * 2).to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&2u16.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&16u16.to_le_bytes()).map_err(|e| e.to_string())?;
+
+    // data subchunk
+    file.write_all(b"data").map_err(|e| e.to_string())?;
+    file.write_all(&data_len.to_le_bytes()).map_err(|e| e.to_string())?;
+
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        let sample_i16 = (clamped * 32767.0) as i16;
+        file.write_all(&sample_i16.to_le_bytes()).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
