@@ -15,44 +15,44 @@ pub struct ModelInfo {
 pub const SUPPORTED_MODELS: &[ModelInfo] = &[
     ModelInfo {
         name: "tiny",
-        repo_id: "openai/whisper-tiny",
-        file_name: "model.safetensors",
-        size_mb: 151,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-tiny.bin",
+        size_mb: 75,
         is_multilingual: true,
     },
     ModelInfo {
         name: "base",
-        repo_id: "openai/whisper-base",
-        file_name: "model.safetensors",
-        size_mb: 290,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-base.bin",
+        size_mb: 142,
         is_multilingual: true,
     },
     ModelInfo {
         name: "small",
-        repo_id: "openai/whisper-small",
-        file_name: "model.safetensors",
-        size_mb: 967,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-small.bin",
+        size_mb: 466,
         is_multilingual: true,
     },
     ModelInfo {
         name: "medium",
-        repo_id: "openai/whisper-medium",
-        file_name: "model.safetensors",
-        size_mb: 3060,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-medium.bin",
+        size_mb: 1500,
         is_multilingual: true,
     },
     ModelInfo {
         name: "large-v2",
-        repo_id: "openai/whisper-large-v2",
-        file_name: "model.safetensors",
-        size_mb: 6180,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-large-v2.bin",
+        size_mb: 3100,
         is_multilingual: true,
     },
     ModelInfo {
         name: "large-v3",
-        repo_id: "openai/whisper-large-v3",
-        file_name: "model.safetensors",
-        size_mb: 6180,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-large-v3.bin",
+        size_mb: 3100,
         is_multilingual: true,
     },
 ];
@@ -107,9 +107,26 @@ fn dirs_local_data() -> Option<PathBuf> {
 }
 
 pub fn find_model(model_name: &str, base_dir: &Path) -> Option<PathBuf> {
+    // 1. Check for GGML binary weights first (preferred for Vulkan / GPU VRAM acceleration)
+    let ggml_path = base_dir.join(format!("ggml-{}.bin", model_name));
+    if ggml_path.is_file() {
+        return Some(ggml_path);
+    }
+
+    let bin_path = base_dir.join(format!("{}.bin", model_name));
+    if bin_path.is_file() {
+        return Some(bin_path);
+    }
+
+    // 2. Check for SafeTensors weights
     let safetensors_path = base_dir.join(format!("{}.safetensors", model_name));
     if safetensors_path.is_file() {
         return Some(safetensors_path);
+    }
+
+    let sub_ggml = base_dir.join(model_name).join(format!("ggml-{}.bin", model_name));
+    if sub_ggml.is_file() {
+        return Some(sub_ggml);
     }
 
     let sub_safetensors = base_dir.join(model_name).join("model.safetensors");
