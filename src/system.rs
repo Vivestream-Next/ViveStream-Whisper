@@ -139,13 +139,13 @@ fn inspect_windows_adapter(subkey: &str, idx: usize) -> Option<GpuInfo> {
     };
 
     let compute_capability = if vendor == "Intel" && desc_lower.contains("arc") {
-        "Intel Xe-HPG / OpenVINO Native".to_string()
+        "Vulkan 1.3 / Intel Xe-HPG VRAM Acceleration".to_string()
     } else if vendor == "NVIDIA" {
-        "NVIDIA CUDA / Tensor Core".to_string()
+        "Vulkan 1.3 / NVIDIA Tensor Core Acceleration".to_string()
     } else if vendor == "AMD" {
-        "AMD ROCm / RDNA Vector Engine".to_string()
+        "Vulkan 1.3 / AMD RDNA Vector Acceleration".to_string()
     } else {
-        "DirectML / Standard GPU Acceleration".to_string()
+        "Vulkan 1.3 / Hardware GPU Acceleration".to_string()
     };
 
     let vram_mb = vram_bytes / (1024 * 1024);
