@@ -276,7 +276,7 @@ fn run_whisper_cli_transcription(
 #[derive(Parser, Debug)]
 #[command(name = "vivestream-whisper")]
 #[command(author = "Vivestream Revived Team")]
-#[command(version = "1.0.0")]
+#[command(version = "2.0.0")]
 #[command(about = "Pure Rust Native Whisper Engine for Synced Lyrics & Subtitles", long_about = None)]
 struct Cli {
     /// Path to input audio or video file
