@@ -19,19 +19,21 @@ This repository contains the production Whisper lyrics & subtitles engine:
 ## 2. Native Rust Binary: Deep Dive (`vivestream-whisper`)
 
 
-### Tech Stack & Crates
+### Tech Stack & Architecture
 - **Language**: Rust 2021 edition.
-- **Inference Runtime**: Hugging Face **`candle-core`** & **`candle-transformers`** (v0.11.0). 100% pure Rust neural network execution.
-- **Audio Decoder**: **`symphonia`** (v0.5.5). Pure Rust decoding of MP3, FLAC, WAV, AAC, M4A, OGG with automatic 16,000 Hz resampling.
-- **Hardware Scanner**: **`sysinfo`** (v0.33.1). Inspects CPU cores, RAM, and available memory.
-- **CLI & Serialization**: `clap` (derive) & `serde` / `serde_json`.
+- **Inference Runtime (Dual-Engine)**:
+  - **Vulkan 1.3 GPU Engine**: `whisper.cpp` + `ggml-vulkan` compute shaders for hardware acceleration on **Intel Arc (e.g. A770, A750)**, **AMD Radeon**, and **NVIDIA GeForce** discrete GPUs. Full weights loaded directly into GPU VRAM.
+  - **Candle CPU Engine**: Hugging Face **`candle-core`** & **`candle-transformers`** (v0.11.0) multi-threaded CPU SIMD execution (Rayon / AVX2) for CPU-only systems and fallback.
+- **Audio Decoder**: **`symphonia`** (v0.5.5) pure Rust multi-format decoder (MP4, MKV, MP3, FLAC, WAV, AAC, M4A, ALAC, OGG) with automatic 16,000 Hz mono resampling.
+- **Hardware Scanner**: Windows Registry & sysinfo scanning for discrete GPUs, VRAM capacity, driver versions, CPU cores, and RAM.
+- **CLI & Serialization**: `clap` (derive) & `serde` / `serde_json` with real-time NDJSON progress streaming.
 
 ### Embedded Assets
 To guarantee the binary runs anywhere without external support files, the following are embedded directly into the binary via `include_bytes!`:
 1. `src/tokenizer.json` (2.48 MB): Official multilingual Whisper tokenizer (BPE).
 2. `src/mel_80.bin` (64 KB): Pre-extracted 80-channel log-mel filterbank matrix (16,080 float32s).
 
-**Resulting Executable Size**: **7.79 MB** (7,799,296 bytes).
+**Resulting Executable Size**: **8.1 MB** (zero Python, zero PyTorch, zero external SDKs).
 
 ---
 
@@ -115,23 +117,23 @@ vivestream-whisper.exe --list-models --models-dir <DIR>
     {
       "name": "tiny",
       "expected_size_mb": 75,
-      "download_url": "https://huggingface.co/openai/whisper-tiny/resolve/main/model.safetensors",
+      "download_url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
       "installed": true,
-      "path": "models\\tiny.safetensors"
+      "path": "models\\ggml-tiny.bin"
     },
     {
       "name": "base",
-      "expected_size_mb": 140,
-      "download_url": "https://huggingface.co/openai/whisper-base/resolve/main/model.safetensors",
+      "expected_size_mb": 142,
+      "download_url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
       "installed": true,
-      "path": "models\\base.safetensors"
+      "path": "models\\ggml-base.bin"
     },
     {
       "name": "small",
-      "expected_size_mb": 460,
-      "download_url": "https://huggingface.co/openai/whisper-small/resolve/main/model.safetensors",
+      "expected_size_mb": 466,
+      "download_url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
       "installed": true,
-      "path": "models\\small.safetensors"
+      "path": "models\\ggml-small.bin"
     }
   ]
 }
@@ -213,13 +215,17 @@ Direct payload for Tauri IPC:
 
 ## 6. How to Integrate into Vivestream Revived (Tauri App)
 
-### Directory Layout in Vivestream User's System
+### Directory Layout in ViveStream User's System
 ```
-%LOCALAPPDATA%\VivestreamRevived\whisper\
-├── vivestream-whisper.exe       # Downloaded on-demand (~7.8 MB)
-└── models\
-    ├── base.safetensors         # Downloaded on-demand (~140 MB)
-    └── small.safetensors        # Optional high-tier model (~922 MB)
+%APPDATA%\com.localghost.vivestream-next\bin\
+├── vivestream-whisper.exe       # Native orchestrator (~8.1 MB)
+├── whisper-cli.exe              # Vulkan 1.3 Whisper inference engine (~480 KB)
+├── ggml-vulkan.dll              # Vulkan compute shaders backend
+├── whisper.dll, ggml.dll        # GGML runtime libraries
+└── %USERPROFILE%\ViveStream\AI\Whisper\
+    ├── ggml-tiny.bin            # ~75 MB (Ultra Fast preview)
+    ├── ggml-base.bin            # ~142 MB (Balanced lyric & subtitle generation)
+    └── ggml-medium.bin          # ~1.5 GB (Studio precision)
 ```
 
 ### Step 1: Rust Backend Command (`src-tauri/src/whisper.rs`)
