@@ -15,44 +15,51 @@ pub struct ModelInfo {
 pub const SUPPORTED_MODELS: &[ModelInfo] = &[
     ModelInfo {
         name: "tiny",
-        repo_id: "openai/whisper-tiny",
-        file_name: "model.safetensors",
-        size_mb: 151,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-tiny.bin",
+        size_mb: 78,
         is_multilingual: true,
     },
     ModelInfo {
         name: "base",
-        repo_id: "openai/whisper-base",
-        file_name: "model.safetensors",
-        size_mb: 290,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-base.bin",
+        size_mb: 148,
         is_multilingual: true,
     },
     ModelInfo {
         name: "small",
-        repo_id: "openai/whisper-small",
-        file_name: "model.safetensors",
-        size_mb: 966,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-small.bin",
+        size_mb: 488,
         is_multilingual: true,
     },
     ModelInfo {
         name: "medium",
-        repo_id: "openai/whisper-medium",
-        file_name: "model.safetensors",
-        size_mb: 1500,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-medium.bin",
+        size_mb: 1530,
         is_multilingual: true,
     },
     ModelInfo {
         name: "large-v2",
-        repo_id: "openai/whisper-large-v2",
-        file_name: "model.safetensors",
-        size_mb: 3100,
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-large-v2.bin",
+        size_mb: 3090,
         is_multilingual: true,
     },
     ModelInfo {
         name: "large-v3",
-        repo_id: "openai/whisper-large-v3",
-        file_name: "model.safetensors",
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-large-v3.bin",
         size_mb: 3100,
+        is_multilingual: true,
+    },
+    ModelInfo {
+        name: "large-v3-turbo",
+        repo_id: "ggerganov/whisper.cpp",
+        file_name: "ggml-large-v3-turbo.bin",
+        size_mb: 1624,
         is_multilingual: true,
     },
 ];
@@ -107,18 +114,7 @@ fn dirs_local_data() -> Option<PathBuf> {
 }
 
 pub fn find_model(model_name: &str, base_dir: &Path) -> Option<PathBuf> {
-    // 1. Check for SafeTensors weights first (native Candle engine)
-    let safetensors_path = base_dir.join(format!("{}.safetensors", model_name));
-    if safetensors_path.is_file() {
-        return Some(safetensors_path);
-    }
-
-    let sub_safetensors = base_dir.join(model_name).join("model.safetensors");
-    if sub_safetensors.is_file() {
-        return Some(sub_safetensors);
-    }
-
-    // 2. Check for GGML binary weights (whisper.cpp engine)
+    // 1. Check for GGML binary weights first (whisper.cpp engine with Vulkan GPU acceleration)
     let ggml_path = base_dir.join(format!("ggml-{}.bin", model_name));
     if ggml_path.is_file() {
         return Some(ggml_path);
@@ -134,9 +130,23 @@ pub fn find_model(model_name: &str, base_dir: &Path) -> Option<PathBuf> {
         return Some(sub_ggml);
     }
 
+    // 2. Check for SafeTensors weights (Candle CPU fallback engine)
+    let safetensors_path = base_dir.join(format!("{}.safetensors", model_name));
+    if safetensors_path.is_file() {
+        return Some(safetensors_path);
+    }
+
+    let sub_safetensors = base_dir.join(model_name).join("model.safetensors");
+    if sub_safetensors.is_file() {
+        return Some(sub_safetensors);
+    }
+
     // Alias fallback for "large"
     if model_name == "large" {
         if let Some(p) = find_model("large-v3", base_dir) {
+            return Some(p);
+        }
+        if let Some(p) = find_model("large-v3-turbo", base_dir) {
             return Some(p);
         }
         if let Some(p) = find_model("large-v2", base_dir) {
