@@ -499,6 +499,26 @@ fn main() {
             return;
         }
 
+        let model_path = if is_bin && whisper_cli_opt.is_none() {
+            let safetensors_cand = models_dir.join(format!("{}.safetensors", model_name));
+            if safetensors_cand.is_file() {
+                safetensors_cand
+            } else {
+                let err_msg = format!(
+                    "Model '{}' is in GGML format, which requires whisper-cli.exe for GPU inference. Download the SafeTensors model to run CPU benchmarks.",
+                    model_name
+                );
+                if cli.json {
+                    println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
+                } else {
+                    eprintln!("Error: {}", err_msg);
+                }
+                std::process::exit(1);
+            }
+        } else {
+            model_path
+        };
+
         let config = engine::get_config_for_model(model_name);
         let tokenizer_bytes = include_bytes!("tokenizer.json");
         let tokenizer = match tokenizers::Tokenizer::from_bytes(tokenizer_bytes) {
@@ -661,6 +681,27 @@ fn main() {
             Ok(res) => res,
             Err(e) => {
                 eprintln!("[Vulkan Fallback] GPU notice: {}. Running CPU engine...", e);
+                let fallback_model_path = if is_bin {
+                    let cand = models_dir.join(format!("{}.safetensors", cli.model));
+                    if cand.is_file() {
+                        cand
+                    } else {
+                        let err_msg = format!(
+                            "Vulkan GPU engine encountered an error ({}) and no SafeTensors model ({}.safetensors) was found for CPU fallback.",
+                            e,
+                            cli.model
+                        );
+                        if cli.json {
+                            println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
+                        } else {
+                            eprintln!("Error: {}", err_msg);
+                        }
+                        std::process::exit(1);
+                    }
+                } else {
+                    model_path
+                };
+
                 let config = engine::get_config_for_model(&cli.model);
                 let tokenizer_bytes = include_bytes!("tokenizer.json");
                 let tokenizer = match tokenizers::Tokenizer::from_bytes(tokenizer_bytes) {
@@ -675,7 +716,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                let mut engine = match engine::WhisperEngine::new(&model_path, config, tokenizer, candle_core::Device::Cpu) {
+                let mut engine = match engine::WhisperEngine::new(&fallback_model_path, config, tokenizer, candle_core::Device::Cpu) {
                     Ok(eng) => eng,
                     Err(err) => {
                         let err_msg = format!("Failed to initialize engine: {}", err);
@@ -707,6 +748,27 @@ fn main() {
         }
     } else {
         // 2. Load Whisper model configuration and tokenizer
+        let safetensors_path = if is_bin {
+            let cand = models_dir.join(format!("{}.safetensors", cli.model));
+            if cand.is_file() {
+                cand
+            } else {
+                let err_msg = format!(
+                    "Model file '{}' is in GGML binary format, which requires 'whisper-cli.exe' for Vulkan GPU acceleration. The built-in pure Rust Candle engine requires a SafeTensors file ({}.safetensors). Please download the SafeTensors model in AI Studio.",
+                    model_path.display(),
+                    cli.model
+                );
+                if cli.json {
+                    println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
+                } else {
+                    eprintln!("Error: {}", err_msg);
+                }
+                std::process::exit(1);
+            }
+        } else {
+            model_path
+        };
+
         let config = engine::get_config_for_model(&cli.model);
 
         // Load tokenizer
@@ -731,14 +793,11 @@ fn main() {
             _ => cli.device.as_str(),
         };
         if !cli.json {
-            if is_gpu && !is_bin {
-                eprintln!("[Notice] Model is in legacy .safetensors format (CPU only). For Vulkan GPU VRAM acceleration on Intel Arc, download the GGML model (ggml-{}.bin) in AI Studio.", cli.model);
-            }
             eprintln!("[Compute] Acceleration device target: {}", target_device_name);
             eprintln!("[3/3] Generating synchronized lyrics and subtitles...");
         }
         let device = candle_core::Device::Cpu;
-        let mut engine = match engine::WhisperEngine::new(&model_path, config, tokenizer, device) {
+        let mut engine = match engine::WhisperEngine::new(&safetensors_path, config, tokenizer, device) {
             Ok(eng) => eng,
             Err(e) => {
                 let err_msg = format!("Failed to initialize engine: {}", e);
