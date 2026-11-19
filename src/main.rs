@@ -174,103 +174,121 @@ fn run_whisper_cli_transcription(
 
     let total_dur = pcm.len() as f64 / 16000.0;
     let temp_dir = std::env::temp_dir();
-    let temp_wav = temp_dir.join(format!("vivestream_vulkan_{}.wav", std::process::id()));
+    let temp_wav = temp_dir.join(format!("vivestream_audio_{}.wav", std::process::id()));
 
     // Write PCM to 16kHz mono WAV
     audio::write_wav(pcm, &temp_wav)?;
 
-    let mut cmd = Command::new(whisper_cli_path);
-    cmd.arg("-m").arg(model_path);
-    cmd.arg("-f").arg(&temp_wav);
-    cmd.arg("-pp"); // print progress callback
-    cmd.arg("-ojf"); // output JSON full
+    let execute_cli = |use_gpu: bool| -> Result<exporters::TranscriptionResult, String> {
+        let mut cmd = Command::new(whisper_cli_path);
+        cmd.arg("-m").arg(model_path);
+        cmd.arg("-f").arg(&temp_wav);
+        cmd.arg("-pp"); // print progress callback
+        cmd.arg("-ojf"); // output JSON full
+        cmd.arg("-nfa"); // disable flash-attn to prevent Vulkan crashes on Intel Arc / non-matrix GPUs
 
-    if language != "auto" && !language.is_empty() {
-        cmd.arg("-l").arg(language);
-    } else {
-        cmd.arg("-l").arg("auto");
-    }
+        if language != "auto" && !language.is_empty() {
+            cmd.arg("-l").arg(language);
+        } else {
+            cmd.arg("-l").arg("auto");
+        }
 
-    if task == "translate" {
-        cmd.arg("-tr");
-    }
+        if task == "translate" {
+            cmd.arg("-tr");
+        }
 
-    let device_lower = device_arg.to_lowercase();
-    if device_lower == "cpu" {
-        cmd.arg("-ng");
-    } else {
-        cmd.arg("-dev").arg("0");
-    }
+        if use_gpu {
+            cmd.arg("-dev").arg("0");
+        } else {
+            cmd.arg("-ng");
+        }
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
 
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn whisper-cli: {}", e))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn whisper-cli: {}", e))?;
 
-    let stderr = child.stderr.take();
-    let progress_flag = progress;
+        let stderr = child.stderr.take();
+        let progress_flag = progress;
+        let device_tag = if use_gpu { "GPU Vulkan" } else { "CPU Native" };
 
-    let stderr_handle = std::thread::spawn(move || {
-        let mut err_log = Vec::new();
-        if let Some(err) = stderr {
-            let reader = BufReader::new(err);
-            for line in reader.lines().flatten() {
-                if line.contains("progress =") {
-                    if let Some(pos) = line.find("progress =") {
-                        let rem = &line[pos + "progress =".len()..];
-                        let clean = rem.trim().trim_end_matches('%');
-                        if let Ok(pct) = clean.parse::<f64>() {
-                            let seek_sec = (pct / 100.0) * total_dur;
-                            let msg = format!("Vulkan GPU Inference (Arc A770 VRAM): {:.0}%", pct);
-                            emit_progress(progress_flag, "transcribing", pct, seek_sec, total_dur, &msg);
+        let stderr_handle = std::thread::spawn(move || {
+            let mut err_log = Vec::new();
+            if let Some(err) = stderr {
+                let reader = BufReader::new(err);
+                for line in reader.lines().flatten() {
+                    if line.contains("progress =") {
+                        if let Some(pos) = line.find("progress =") {
+                            let rem = &line[pos + "progress =".len()..];
+                            let clean = rem.trim().trim_end_matches('%');
+                            if let Ok(pct) = clean.parse::<f64>() {
+                                let seek_sec = (pct / 100.0) * total_dur;
+                                let msg = format!("Whisper {} Inference: {:.0}%", device_tag, pct);
+                                emit_progress(progress_flag, "transcribing", pct, seek_sec, total_dur, &msg);
+                            }
                         }
                     }
+                    err_log.push(line);
                 }
-                err_log.push(line);
             }
+            err_log.join("\n")
+        });
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("Error waiting on whisper-cli: {}", e))?;
+
+        let stderr_text = stderr_handle.join().unwrap_or_default();
+
+        let json_output_path = temp_wav.with_extension("wav.json");
+        if json_output_path.is_file() {
+            let json_str = std::fs::read_to_string(&json_output_path)
+                .map_err(|e| format!("Failed to read whisper-cli JSON: {}", e))?;
+            let json_val = serde_json::from_str::<serde_json::Value>(&json_str)
+                .map_err(|e| format!("Failed to parse whisper-cli JSON: {}", e))?;
+            let mut res = parse_whisper_cli_json(&json_val, language);
+            if res.duration <= 0.0 {
+                res.duration = total_dur;
+            }
+            let _ = std::fs::remove_file(&json_output_path);
+            Ok(res)
+        } else if !status.success() {
+            Err(format!("Exit code {:?}. Details: {}", status.code(), stderr_text.trim()))
+        } else {
+            Err(format!("No JSON output generated. Stderr: {}", stderr_text.trim()))
         }
-        err_log.join("\n")
-    });
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("Error waiting on whisper-cli: {}", e))?;
-
-    let _ = stderr_handle.join();
-
-    let json_output_path = temp_wav.with_extension("wav.json");
-    let result = if json_output_path.is_file() {
-        let json_str = std::fs::read_to_string(&json_output_path)
-            .map_err(|e| format!("Failed to read whisper-cli JSON: {}", e))?;
-        let json_val = serde_json::from_str::<serde_json::Value>(&json_str)
-            .map_err(|e| format!("Failed to parse whisper-cli JSON: {}", e))?;
-        let mut res = parse_whisper_cli_json(&json_val, language);
-        if res.duration <= 0.0 {
-            res.duration = total_dur;
-        }
-        Ok(res)
-    } else if !status.success() {
-        Err(format!("Vulkan GPU Whisper failed with status {:?}", status))
-    } else {
-        Err("Vulkan GPU Whisper produced no JSON output".to_string())
     };
 
-    // Clean up temporary files
+    let device_lower = device_arg.to_lowercase();
+    let want_gpu = device_lower != "cpu";
+
+    let final_res = if want_gpu {
+        match execute_cli(true) {
+            Ok(res) => Ok(res),
+            Err(gpu_err) => {
+                eprintln!("[Whisper Engine] Vulkan GPU execution encountered notice ({}). Gracefully falling back to High-Performance CPU inference...", gpu_err);
+                execute_cli(false)
+            }
+        }
+    } else {
+        execute_cli(false)
+    };
+
+    // Clean up temporary audio files
     let _ = std::fs::remove_file(&temp_wav);
-    let _ = std::fs::remove_file(&json_output_path);
     let _ = std::fs::remove_file(temp_wav.with_extension("wav.lrc"));
     let _ = std::fs::remove_file(temp_wav.with_extension("wav.srt"));
     let _ = std::fs::remove_file(temp_wav.with_extension("wav.vtt"));
 
-    result
+    final_res
 }
 
 #[derive(Parser, Debug)]
@@ -659,14 +677,13 @@ fn main() {
         );
     }
 
-    let is_gpu = cli.device.to_lowercase() != "cpu";
     let is_bin = model_path.extension().and_then(|s| s.to_str()) == Some("bin");
     let whisper_cli_opt = find_whisper_cli();
 
-    let result = if is_gpu && is_bin && whisper_cli_opt.is_some() {
+    let result = if is_bin && whisper_cli_opt.is_some() {
         let whisper_cli_path = whisper_cli_opt.unwrap();
         if !cli.json {
-            eprintln!("[Compute] Accelerating via Vulkan on GPU (Intel Arc / Discrete GPU VRAM)...");
+            eprintln!("[Compute] Processing with Whisper Engine (GPU/CPU Acceleration)...");
             eprintln!("[3/3] Generating synchronized lyrics and subtitles...");
         }
         match run_whisper_cli_transcription(
@@ -680,69 +697,60 @@ fn main() {
         ) {
             Ok(res) => res,
             Err(e) => {
-                eprintln!("[Vulkan Fallback] GPU notice: {}. Running CPU engine...", e);
-                let fallback_model_path = if is_bin {
-                    let cand = models_dir.join(format!("{}.safetensors", cli.model));
-                    if cand.is_file() {
-                        cand
-                    } else {
-                        let err_msg = format!(
-                            "Vulkan GPU engine encountered an error ({}) and no SafeTensors model ({}.safetensors) was found for CPU fallback.",
-                            e,
-                            cli.model
-                        );
-                        if cli.json {
-                            println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
-                        } else {
-                            eprintln!("Error: {}", err_msg);
+                let safetensors_cand = models_dir.join(format!("{}.safetensors", cli.model));
+                if safetensors_cand.is_file() {
+                    eprintln!("[Fallback] Trying secondary SafeTensors Candle engine: {}...", e);
+                    let config = engine::get_config_for_model(&cli.model);
+                    let tokenizer_bytes = include_bytes!("tokenizer.json");
+                    let tokenizer = match tokenizers::Tokenizer::from_bytes(tokenizer_bytes) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            let err_msg = format!("Failed to initialize Whisper tokenizer: {}", err);
+                            if cli.json {
+                                println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
+                            } else {
+                                eprintln!("Error: {}", err_msg);
+                            }
+                            std::process::exit(1);
                         }
-                        std::process::exit(1);
+                    };
+                    let mut engine = match engine::WhisperEngine::new(&safetensors_cand, config, tokenizer, candle_core::Device::Cpu) {
+                        Ok(eng) => eng,
+                        Err(err) => {
+                            let err_msg = format!("Secondary engine failed: {}", err);
+                            if cli.json {
+                                println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
+                            } else {
+                                eprintln!("Error: {}", err_msg);
+                            }
+                            std::process::exit(1);
+                        }
+                    };
+                    let lang_opt = if cli.language == "auto" || cli.language.is_empty() {
+                        None
+                    } else {
+                        Some(cli.language.as_str())
+                    };
+                    match engine.transcribe_pcm(&pcm, lang_opt, &cli.task) {
+                        Ok(candle_res) => candle_res,
+                        Err(err) => {
+                            let err_msg = format!("Transcription failed: {}", err);
+                            if cli.json {
+                                println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
+                            } else {
+                                eprintln!("Error: {}", err_msg);
+                            }
+                            std::process::exit(1);
+                        }
                     }
                 } else {
-                    model_path
-                };
-
-                let config = engine::get_config_for_model(&cli.model);
-                let tokenizer_bytes = include_bytes!("tokenizer.json");
-                let tokenizer = match tokenizers::Tokenizer::from_bytes(tokenizer_bytes) {
-                    Ok(t) => t,
-                    Err(err) => {
-                        let err_msg = format!("Failed to initialize Whisper tokenizer: {}", err);
-                        if cli.json {
-                            println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
-                        } else {
-                            eprintln!("Error: {}", err_msg);
-                        }
-                        std::process::exit(1);
+                    let err_msg = format!("Whisper transcription failed: {}", e);
+                    if cli.json {
+                        println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
+                    } else {
+                        eprintln!("Error: {}", err_msg);
                     }
-                };
-                let mut engine = match engine::WhisperEngine::new(&fallback_model_path, config, tokenizer, candle_core::Device::Cpu) {
-                    Ok(eng) => eng,
-                    Err(err) => {
-                        let err_msg = format!("Failed to initialize engine: {}", err);
-                        if cli.json {
-                            println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
-                        } else {
-                            eprintln!("Error: {}", err_msg);
-                        }
-                        std::process::exit(1);
-                    }
-                };
-                let progress_flag = cli.progress;
-                let mut on_prog = move |pct: f64, seek: f64, total: f64, msg: &str| {
-                    emit_progress(progress_flag, "transcribing", pct, seek, total, msg);
-                };
-                match engine.transcribe_pcm_with_progress(&pcm, Some(&cli.language), &cli.task, Some(&mut on_prog)) {
-                    Ok(res) => res,
-                    Err(err) => {
-                        let err_msg = format!("Transcription error: {}", err);
-                        if cli.json {
-                            println!("{}", serde_json::json!({ "success": false, "error": err_msg }));
-                        } else {
-                            eprintln!("Error: {}", err_msg);
-                        }
-                        std::process::exit(1);
-                    }
+                    std::process::exit(1);
                 }
             }
         }
